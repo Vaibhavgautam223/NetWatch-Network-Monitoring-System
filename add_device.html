@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Add device · NetWatch{% endblock %}
+{% block content %}
+  <section class="hero compact"><div><p class="eyebrow">DEVICE INVENTORY</p><h1>Add a device</h1><p class="muted">Register an IPv4 or IPv6 address that you are authorized to monitor.</p></div></section>
+  <section class="panel form-panel">
+    <form method="post" class="device-form">
+      <label for="name">Device name <span>*</span></label>
+      <input id="name" name="name" maxlength="100" placeholder="e.g. Office Router" required value="{{ request.form.get('name', '') }}">
+      <label for="ip_address">IP address <span>*</span></label>
+      <input id="ip_address" name="ip_address" maxlength="45" placeholder="e.g. 192.168.1.1" required value="{{ request.form.get('ip_address', '') }}">
+      <p class="field-help">Use an IP address, not a website URL or hostname.</p>
+      <label for="description">Description</label>
+      <input id="description" name="description" maxlength="255" placeholder="e.g. Main office gateway" value="{{ request.form.get('description', '') }}">
+      <div class="form-actions"><a class="button secondary" href="{{ url_for('index') }}">Cancel</a><button class="button primary" type="submit">Save device</button></div>
+    </form>
+  </section>
+{% endblock %}

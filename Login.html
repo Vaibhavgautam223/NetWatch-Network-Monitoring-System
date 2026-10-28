@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log in — NetWatch</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
+</head>
+<body>
+    <div class="auth-container">
+        <!-- Left Side Graphic -->
+        <div class="auth-left">
+            <h2>NetWatch</h2>
+            <p>Monitor your network devices with real-time status updates and historical logging. Log in to manage your infrastructure.</p>
+        </div>
+
+        <!-- Right Side Form -->
+        <div class="auth-right">
+            <div class="auth-header">
+                <h1>Welcome Back</h1>
+                <p>Please enter your details to sign in.</p>
+            </div>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endwith %}
+
+            <form method="POST">
+                <div class="input-group">
+                    <!-- placeholder=" " is required for the floating label trick to work -->
+                    <input type="text" name="username" id="username" placeholder=" " required autofocus>
+                    <label for="username">Username</label>
+                </div>
+
+                <div class="input-group">
+                    <input type="password" name="password" id="password" placeholder=" " required>
+                    <label for="password">Password</label>
+                </div>
+
+                <button type="submit" class="auth-btn">Log In</button>
+            </form>
+
+            <div class="auth-switch">
+                Don't have an account? <a href="{{ url_for('register') }}">Create one</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
