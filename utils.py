@@ -1,688 +1,415 @@
-from __future__ import annotations
+import hmac
+from functools import wraps
+from hashlib import sha512
+from urllib.parse import parse_qs
+from urllib.parse import urlencode
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
-import collections.abc as cabc
-import os
-import re
-import sys
-import typing as t
-from functools import update_wrapper
-from gettext import gettext as _
-from types import ModuleType
-from types import TracebackType
+from flask import current_app
+from flask import g
+from flask import has_request_context
+from flask import request
+from flask import session
+from flask import url_for
+from werkzeug.local import LocalProxy
 
-from ._compat import _default_text_stderr
-from ._compat import _default_text_stdout
-from ._compat import _find_binary_writer
-from ._compat import binary_streams
-from ._compat import open_stream
-from ._compat import should_strip_ansi
-from ._compat import strip_ansi
-from ._compat import text_streams
-from ._compat import WIN
-from .globals import resolve_color_default
+from .config import COOKIE_NAME
+from .config import EXEMPT_METHODS
+from .signals import user_logged_in
+from .signals import user_logged_out
+from .signals import user_login_confirmed
 
-if t.TYPE_CHECKING:
-    import typing_extensions as te
-
-    P = te.ParamSpec("P")
-
-R = t.TypeVar("R")
+#: A proxy for the current user. If no user is logged in, this will be an
+#: anonymous user
+current_user = LocalProxy(lambda: _get_user())
 
 
-def _posixify(name: str) -> str:
-    return "-".join(name.split()).lower()
-
-
-def _safecall(func: t.Callable[P, R]) -> t.Callable[P, R | None]:
-    """Wraps a function so that it swallows exceptions.
-
-    :meta private:
+def encode_cookie(payload, key=None):
     """
+    This will encode a ``str`` value into a cookie, and sign that cookie
+    with the app's secret key.
 
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | None:
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            pass
-        return None
+    :param payload: The value to encode, as `str`.
+    :type payload: str
 
-    return update_wrapper(wrapper, func)
-
-
-def make_str(value: t.Any) -> str:
-    """Converts a value into a valid string."""
-    if isinstance(value, bytes):
-        try:
-            return value.decode(sys.getfilesystemencoding())
-        except UnicodeError:
-            return value.decode("utf-8", "replace")
-    return str(value)
-
-
-def _make_default_short_help(help: str, max_length: int = 45) -> str:
-    """Returns a condensed version of help string.
-
-    :meta private:
+    :param key: The key to use when creating the cookie digest. If not
+                specified, the SECRET_KEY value from app config will be used.
+    :type key: str
     """
-    # Consider only the first paragraph.
-    paragraph_end = help.find("\n\n")
-
-    if paragraph_end != -1:
-        help = help[:paragraph_end]
-
-    # Collapse newlines, tabs, and spaces.
-    words = help.split()
-
-    if not words:
-        return ""
-
-    # The first paragraph started with a "no rewrap" marker, ignore it.
-    if words[0] == "\b":
-        words = words[1:]
-
-    total_length = 0
-    last_index = len(words) - 1
-
-    for i, word in enumerate(words):
-        total_length += len(word) + (i > 0)
-
-        if total_length > max_length:  # too long, truncate
-            break
-
-        if word[-1] == ".":  # sentence end, truncate without "..."
-            return " ".join(words[: i + 1])
-
-        if total_length == max_length and i != last_index:
-            break  # not at sentence end, truncate with "..."
-    else:
-        return " ".join(words)  # no truncation needed
-
-    # Account for the length of the suffix.
-    total_length += len("...")
-
-    # remove words until the length is short enough
-    while i > 0:
-        total_length -= len(words[i]) + (i > 0)
-
-        if total_length <= max_length:
-            break
-
-        i -= 1
-
-    return " ".join(words[:i]) + "..."
+    return f"{payload}|{_cookie_digest(payload, key=key)}"
 
 
-class _LazyFile:
-    """A lazy file works like a regular file but it does not fully open
-    the file but it does perform some basic checks early to see if the
-    filename parameter does make sense.  This is useful for safely opening
-    files for writing.
-
-    :meta private:
+def decode_cookie(cookie, key=None):
     """
+    This decodes a cookie given by `encode_cookie`. If verification of the
+    cookie fails, ``None`` will be implicitly returned.
 
-    name: str
-    mode: str
-    encoding: str | None
-    errors: str | None
-    atomic: bool
-    _f: t.IO[t.Any] | None
-    should_close: bool
+    :param cookie: An encoded cookie.
+    :type cookie: str
 
-    def __init__(
-        self,
-        filename: str | os.PathLike[str],
-        mode: str = "r",
-        encoding: str | None = None,
-        errors: str | None = "strict",
-        atomic: bool = False,
-    ) -> None:
-        self.name = os.fspath(filename)
-        self.mode = mode
-        self.encoding = encoding
-        self.errors = errors
-        self.atomic = atomic
-
-        if self.name == "-":
-            self._f, self.should_close = open_stream(filename, mode, encoding, errors)
-        else:
-            if "r" in mode:
-                # Open and close the file in case we're opening it for
-                # reading so that we can catch at least some errors in
-                # some cases early.
-                open(filename, mode).close()
-            self._f = None
-            self.should_close = True
-
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self.open(), name)
-
-    def __repr__(self) -> str:
-        if self._f is not None:
-            return repr(self._f)
-        return f"<unopened file '{format_filename(self.name)}' {self.mode}>"
-
-    def open(self) -> t.IO[t.Any]:
-        """Opens the file if it's not yet open.  This call might fail with
-        a :exc:`FileError`.  Not handling this error will produce an error
-        that Click shows.
-        """
-        if self._f is not None:
-            return self._f
-        try:
-            rv, self.should_close = open_stream(
-                self.name, self.mode, self.encoding, self.errors, atomic=self.atomic
-            )
-        except OSError as e:
-            from .exceptions import FileError
-
-            raise FileError(self.name, hint=e.strerror) from e
-        self._f = rv
-        return rv
-
-    def close(self) -> None:
-        """Closes the underlying file, no matter what."""
-        if self._f is not None:
-            self._f.close()
-
-    def close_intelligently(self) -> None:
-        """This function only closes the file if it was opened by the lazy
-        file wrapper.  For instance this will never close stdin.
-        """
-        if self.should_close:
-            self.close()
-
-    def __enter__(self) -> _LazyFile:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close_intelligently()
-
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        self.open()
-        return iter(self._f)  # type: ignore
-
-
-class _KeepOpenFile:
-    """Proxy a file object but keep it open across a ``with`` block.
-
-    Wraps a borrowed file (such as ``sys.stdin`` or ``sys.stdout``) so that
-    leaving a ``with`` block does not close it, as used by :func:`open_file`
-    for the ``-`` filename. The caller stays responsible for the file: an
-    explicit :meth:`close` still passes through to the wrapped object.
-
-    Dunder methods are proxied explicitly: implicit special-method lookups
-    bypass :meth:`__getattr__`, because Python resolves them on the type rather
-    than the instance.
-
-    :meta private:
+    :param key: The key to use when creating the cookie digest. If not
+                specified, the SECRET_KEY value from app config will be used.
+    :type key: str
     """
-
-    _file: t.IO[t.Any]
-
-    def __init__(self, file: t.IO[t.Any]) -> None:
-        self._file = file
-
-    def __getattr__(self, name: str) -> t.Any:
-        return getattr(self._file, name)
-
-    def __enter__(self) -> _KeepOpenFile:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        pass
-
-    def __repr__(self) -> str:
-        return repr(self._file)
-
-    def __iter__(self) -> cabc.Iterator[t.AnyStr]:
-        return iter(self._file)
-
-
-def echo(
-    message: object = None,
-    file: t.IO[t.Any] | None = None,
-    nl: bool = True,
-    err: bool = False,
-    color: bool | None = None,
-) -> None:
-    """Print a message and newline to stdout or a file. This should be
-    used instead of :func:`print` because it provides better support
-    for different data, files, and environments.
-
-    Compared to :func:`print`, this does the following:
-
-    -   Ensures that the output encoding is not misconfigured on Linux.
-    -   Supports Unicode in the Windows console.
-    -   Supports writing to binary outputs, and supports writing bytes
-        to text outputs.
-    -   Removes ANSI color and style codes if the output does not look
-        like an interactive terminal.
-    -   Always flushes the output.
-
-    :param message: The string or bytes to output. Other objects are
-        converted to strings.
-    :param file: The file to write to. Defaults to ``stdout``.
-    :param err: Write to ``stderr`` instead of ``stdout``.
-    :param nl: Print a newline after the message. Enabled by default.
-    :param color: Force showing or hiding colors and other styles. By
-        default Click will remove color if the output does not look like
-        an interactive terminal.
-
-    .. versionchanged:: 8.5.0
-        Colorama is no longer used for color on Windows.
-
-    .. versionchanged:: 6.0
-        Support Unicode output on the Windows console. Click does not
-        modify ``sys.stdout``, so ``sys.stdout.write()`` and ``print()``
-        will still not support Unicode.
-
-    .. versionchanged:: 4.0
-        Added the ``color`` parameter.
-
-    .. versionadded:: 3.0
-        Added the ``err`` parameter.
-
-    .. versionchanged:: 2.0
-        Support colors on Windows if colorama is installed.
-    """
-    if file is None:
-        if err:
-            file = _default_text_stderr()
-        else:
-            file = _default_text_stdout()
-
-        # There are no standard streams attached to write to. For example,
-        # pythonw on Windows.
-        if file is None:
-            return
-
-    match message:
-        case str() | bytes() | bytearray():
-            out = message
-        case None:
-            out = ""
-        case _:
-            out = str(message)
-
-    if nl:
-        if isinstance(out, str):
-            out += "\n"
-        else:
-            out += b"\n"
-
-    if not out:
-        file.flush()
+    try:
+        payload, digest = cookie.rsplit("|", 1)
+        if hasattr(digest, "decode"):
+            digest = digest.decode("ascii")  # pragma: no cover
+    except ValueError:
         return
 
-    # If there is a message and the value looks like bytes, we manually
-    # need to find the binary stream and write the message in there.
-    # This is done separately so that most stream types will work as you
-    # would expect. Eg: you can write to StringIO for other cases.
-    if isinstance(out, (bytes, bytearray)):
-        binary_file = _find_binary_writer(file)
-        if binary_file is not None:
-            file.flush()
-            binary_file.write(out)
-            binary_file.flush()
-            return
-
-    # ANSI style code support. For no message or bytes, nothing happens.
-    # When outputting to a file instead of a terminal, strip codes.
-    elif should_strip_ansi(file, resolve_color_default(color)):
-        out = strip_ansi(out)
-
-    file.write(out)  # type: ignore
-    file.flush()
+    if hmac.compare_digest(_cookie_digest(payload, key=key), digest):
+        return payload
 
 
-def _get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryIO:
-    """Returns a system stream for byte processing.
-
-    .. deprecated:: 8.5.0
-        Will be removed in Click 9.0.
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-
-    :meta private:
+def make_next_param(login_url, current_url):
     """
-    opener = binary_streams.get(name)
-    if opener is None:
-        raise TypeError(_("Unknown standard stream '{name}'").format(name=name))
-    return opener()
+    Reduces the scheme and host from a given URL so it can be passed to
+    the given `login` URL more efficiently.
 
-
-def _get_text_stream(
-    name: t.Literal["stdin", "stdout", "stderr"],
-    encoding: str | None = None,
-    errors: str | None = "strict",
-) -> t.TextIO:
-    """Returns a system stream for text processing.
-
-    .. deprecated:: 8.5.0
-        Will be removed in Click 9.0.
-
-    This usually returns a wrapped stream around a binary stream returned from
-    :func:`get_binary_stream` but it also can take shortcuts for already
-    correctly configured streams.
-
-
-    :param name: the name of the stream to open.  Valid names are ``'stdin'``,
-                 ``'stdout'`` and ``'stderr'``
-    :param encoding: overrides the detected default encoding.
-    :param errors: overrides the default error mode.
-    :meta private:
+    :param login_url: The login URL being redirected to.
+    :type login_url: str
+    :param current_url: The URL to reduce.
+    :type current_url: str
     """
-    opener = text_streams.get(name)
-    if opener is None:
-        raise TypeError(_("Unknown standard stream '{name}'").format(name=name))
-    return opener(encoding, errors)
+    l_url = urlsplit(login_url)
+    c_url = urlsplit(current_url)
 
-
-def open_file(
-    filename: str | os.PathLike[str],
-    mode: str = "r",
-    encoding: str | None = None,
-    errors: str | None = "strict",
-    lazy: bool = False,
-    atomic: bool = False,
-) -> t.IO[t.Any]:
-    """Open a file, with extra behavior to handle ``'-'`` to indicate
-    a standard stream, lazy open on write, and atomic write. Similar to
-    the behavior of the :class:`~click.File` param type.
-
-    If ``'-'`` is given to open ``stdout`` or ``stdin``, the stream is
-    wrapped so that using it in a context manager will not close it.
-    This makes it possible to use the function without accidentally
-    closing a standard stream:
-
-    .. code-block:: python
-
-        with open_file(filename) as f:
-            ...
-
-    :param filename: The name or Path of the file to open, or ``'-'`` for
-        ``stdin``/``stdout``.
-    :param mode: The mode in which to open the file.
-    :param encoding: The encoding to decode or encode a file opened in
-        text mode.
-    :param errors: The error handling mode.
-    :param lazy: Wait to open the file until it is accessed. For read
-        mode, the file is temporarily opened to raise access errors
-        early, then closed until it is read again.
-    :param atomic: Write to a temporary file and replace the given file
-        on close.
-
-    .. versionadded:: 3.0
-    """
-    if lazy:
-        return t.cast(
-            "t.IO[t.Any]", _LazyFile(filename, mode, encoding, errors, atomic=atomic)
-        )
-
-    f, should_close = open_stream(filename, mode, encoding, errors, atomic=atomic)
-
-    if not should_close:
-        f = t.cast("t.IO[t.Any]", _KeepOpenFile(f))
-
-    return f
-
-
-def format_filename(
-    filename: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-    shorten: bool = False,
-) -> str:
-    """Format a filename as a string for display. Ensures the filename can be
-    displayed by replacing any invalid bytes or surrogate escapes in the name
-    with the replacement character ``�``.
-
-    Invalid bytes or surrogate escapes will raise an error when written to a
-    stream with ``errors="strict"``. This will typically happen with ``stdout``
-    when the locale is something like ``en_GB.UTF-8``.
-
-    Many scenarios *are* safe to write surrogates though, due to PEP 538 and
-    PEP 540, including:
-
-    -   Writing to ``stderr``, which uses ``errors="backslashreplace"``.
-    -   The system has ``LANG=C.UTF-8``, ``C``, or ``POSIX``. Python opens
-        stdout and stderr with ``errors="surrogateescape"``.
-    -   None of ``LANG/LC_*`` are set. Python assumes ``LANG=C.UTF-8``.
-    -   Python is started in UTF-8 mode  with  ``PYTHONUTF8=1`` or ``-X utf8``.
-        Python opens stdout and stderr with ``errors="surrogateescape"``.
-
-    :param filename: formats a filename for UI display.  This will also convert
-                     the filename into unicode without failing.
-    :param shorten: this optionally shortens the filename to strip of the
-                    path that leads up to it.
-    """
-    if shorten:
-        filename = os.path.basename(filename)
-    else:
-        filename = os.fspath(filename)
-
-    if isinstance(filename, bytes):
-        filename = filename.decode(sys.getfilesystemencoding(), "replace")
-    else:
-        filename = filename.encode("utf-8", "surrogateescape").decode(
-            "utf-8", "replace"
-        )
-
-    return filename
-
-
-def get_app_dir(app_name: str, roaming: bool = True, force_posix: bool = False) -> str:
-    r"""Returns the config folder for the application.  The default behavior
-    is to return whatever is most appropriate for the operating system.
-
-    To give you an idea, for an app called ``"Foo Bar"``, something like
-    the following folders could be returned:
-
-    Mac OS X:
-      ``~/Library/Application Support/Foo Bar``
-    Mac OS X (POSIX):
-      ``~/.foo-bar``
-    Unix:
-      ``~/.config/foo-bar``
-    Unix (POSIX):
-      ``~/.foo-bar``
-    Windows (roaming):
-      ``C:\Users\<user>\AppData\Roaming\Foo Bar``
-    Windows (not roaming):
-      ``C:\Users\<user>\AppData\Local\Foo Bar``
-
-    .. versionadded:: 2.0
-
-    :param app_name: the application name.  This should be properly capitalized
-                     and can contain whitespace.
-    :param roaming: controls if the folder should be roaming or not on Windows.
-                    Has no effect otherwise.
-    :param force_posix: if this is set to `True` then on any POSIX system the
-                        folder will be stored in the home folder with a leading
-                        dot instead of the XDG config home or darwin's
-                        application support folder.
-    """
-    if WIN:
-        key = "APPDATA" if roaming else "LOCALAPPDATA"
-        folder = os.environ.get(key)
-        if folder is None:
-            folder = os.path.expanduser("~")
-        return os.path.join(folder, app_name)
-    if force_posix:
-        return os.path.join(os.path.expanduser(f"~/.{_posixify(app_name)}"))
-    if sys.platform == "darwin":
-        return os.path.join(
-            os.path.expanduser("~/Library/Application Support"), app_name
-        )
-    return os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        _posixify(app_name),
-    )
-
-
-class _PacifyFlushWrapper:
-    """This wrapper is used to catch and suppress BrokenPipeErrors resulting
-    from ``.flush()`` being called on broken pipe during the shutdown/final-GC
-    of the Python interpreter. Notably ``.flush()`` is always called on
-    ``sys.stdout`` and ``sys.stderr``. So as to have minimal impact on any
-    other cleanup code, and the case where the underlying file is not a broken
-    pipe, all calls and attributes are proxied.
-
-    :meta private:
-    """
-
-    wrapped: t.IO[t.Any]
-
-    def __init__(self, wrapped: t.IO[t.Any]) -> None:
-        self.wrapped = wrapped
-
-    def flush(self) -> None:
-        try:
-            self.wrapped.flush()
-        except OSError as e:
-            import errno
-
-            if e.errno != errno.EPIPE:
-                raise
-
-    def __getattr__(self, attr: str) -> t.Any:
-        return getattr(self.wrapped, attr)
-
-
-def _detect_program_name(
-    path: str | None = None, _main: ModuleType | None = None
-) -> str:
-    """Determine the command used to run the program, for use in help
-    text. If a file or entry point was executed, the file name is
-    returned. If ``python -m`` was used to execute a module or package,
-    ``python -m name`` is returned.
-
-    This doesn't try to be too precise, the goal is to give a concise
-    name for help text. Files are only shown as their name without the
-    path. ``python`` is only shown for modules, and the full path to
-    ``sys.executable`` is not shown.
-
-    :param path: The Python file being executed. Python puts this in
-        ``sys.argv[0]``, which is used by default.
-    :param _main: The ``__main__`` module. This should only be passed
-        during internal testing.
-
-    .. versionadded:: 8.0
-        Based on command args detection in the Werkzeug reloader.
-
-    :meta private:
-    """
-    if _main is None:
-        _main = sys.modules["__main__"]
-
-    if not path:
-        path = sys.argv[0]
-
-    # The value of __package__ indicates how Python was called. It may
-    # not exist if a setuptools script is installed as an egg. It may be
-    # set incorrectly for entry points created with pip on Windows.
-    # It is set to "" inside a Shiv or PEX zipapp.
-    if getattr(_main, "__package__", None) in {None, ""} or (
-        os.name == "nt"
-        and _main.__package__ == ""
-        and not os.path.exists(path)
-        and os.path.exists(f"{path}.exe")
+    if (not l_url.scheme or l_url.scheme == c_url.scheme) and (
+        not l_url.netloc or l_url.netloc == c_url.netloc
     ):
-        # Executed a file, like "python app.py".
-        return os.path.basename(path)
-
-    # Executed a module, like "python -m example".
-    # Rewritten by Python from "-m script" to "/path/to/script.py".
-    # Need to look at main module to determine how it was executed.
-    py_module = t.cast(str, _main.__package__)
-    name = os.path.splitext(os.path.basename(path))[0]
-
-    # A submodule like "example.cli".
-    if name != "__main__":
-        py_module = f"{py_module}.{name}"
-
-    return f"python -m {py_module.lstrip('.')}"
+        return urlunsplit(("", "", c_url.path, c_url.query, ""))
+    return current_url
 
 
-def _expand_args(
-    args: cabc.Iterable[str],
-    *,
-    user: bool = True,
-    env: bool = True,
-    glob_recursive: bool = True,
-) -> list[str]:
-    """Simulate Unix shell expansion with Python functions.
-
-    See :func:`glob.glob`, :func:`os.path.expanduser`, and
-    :func:`os.path.expandvars`.
-
-    This is intended for use on Windows, where the shell does not do any
-    expansion. It may not exactly match what a Unix shell would do.
-
-    :param args: List of command line arguments to expand.
-    :param user: Expand user home directory.
-    :param env: Expand environment variables.
-    :param glob_recursive: ``**`` matches directories recursively.
-
-    .. versionchanged:: 8.1
-        Invalid glob patterns are treated as empty expansions rather
-        than raising an error.
-
-    .. versionadded:: 8.0
-
-    :meta private:
+def expand_login_view(login_view):
     """
-    from glob import glob
+    Returns the url for the login view, expanding the view name to a url if
+    needed.
 
-    out = []
+    :param login_view: The name of the login view or a URL for the login view.
+    :type login_view: str
+    """
+    if login_view.startswith(("https://", "http://", "/")):
+        return login_view
 
-    for arg in args:
-        if user:
-            arg = os.path.expanduser(arg)
+    return url_for(login_view)
 
-        if env:
-            arg = os.path.expandvars(arg)
 
+def login_url(login_view, next_url=None, next_field="next"):
+    """
+    Creates a URL for redirecting to a login page. If only `login_view` is
+    provided, this will just return the URL for it. If `next_url` is provided,
+    however, this will append a ``next=URL`` parameter to the query string
+    so that the login view can redirect back to that URL. Flask-Login's default
+    unauthorized handler uses this function when redirecting to your login url.
+    To force the host name used, set `FORCE_HOST_FOR_REDIRECTS` to a host. This
+    prevents from redirecting to external sites if request headers Host or
+    X-Forwarded-For are present.
+
+    :param login_view: The name of the login view. (Alternately, the actual
+                       URL to the login view.)
+    :type login_view: str
+    :param next_url: The URL to give the login view for redirection.
+    :type next_url: str
+    :param next_field: What field to store the next URL in. (It defaults to
+                       ``next``.)
+    :type next_field: str
+    """
+    base = expand_login_view(login_view)
+
+    if next_url is None:
+        return base
+
+    parsed_result = urlsplit(base)
+    md = parse_qs(parsed_result.query, keep_blank_values=True)
+    md[next_field] = make_next_param(base, next_url)
+    netloc = current_app.config.get("FORCE_HOST_FOR_REDIRECTS") or parsed_result.netloc
+    parsed_result = parsed_result._replace(
+        netloc=netloc, query=urlencode(md, doseq=True)
+    )
+    return urlunsplit(parsed_result)
+
+
+def login_fresh():
+    """
+    This returns ``True`` if the current login is fresh.
+    """
+    return session.get("_fresh", False)
+
+
+def login_remembered():
+    """
+    This returns ``True`` if the current login is remembered across sessions.
+    """
+    config = current_app.config
+    cookie_name = config.get("REMEMBER_COOKIE_NAME", COOKIE_NAME)
+    has_cookie = cookie_name in request.cookies and session.get("_remember") != "clear"
+    if has_cookie:
+        cookie = request.cookies[cookie_name]
+        user_id = decode_cookie(cookie)
+        return user_id is not None
+    return False
+
+
+def login_user(user, remember=False, duration=None, force=False, fresh=True):
+    """
+    Logs a user in. You should pass the actual user object to this. If the
+    user's `is_active` property is ``False``, they will not be logged in
+    unless `force` is ``True``.
+
+    This will return ``True`` if the log in attempt succeeds, and ``False`` if
+    it fails (i.e. because the user is inactive).
+
+    :param user: The user object to log in.
+    :type user: object
+    :param remember: Whether to remember the user after their session expires.
+        Defaults to ``False``.
+    :type remember: bool
+    :param duration: The amount of time before the remember cookie expires. If
+        ``None`` the value set in the settings is used. Defaults to ``None``.
+    :type duration: :class:`datetime.timedelta`
+    :param force: If the user is inactive, setting this to ``True`` will log
+        them in regardless. Defaults to ``False``.
+    :type force: bool
+    :param fresh: setting this to ``False`` will log in the user with a session
+        marked as not "fresh". Defaults to ``True``.
+    :type fresh: bool
+    """
+    if not force and not user.is_active:
+        return False
+
+    user_id = getattr(user, current_app.login_manager.id_attribute)()
+    session["_user_id"] = user_id
+    session["_fresh"] = fresh
+    session["_id"] = current_app.login_manager._session_identifier_generator()
+
+    if remember:
+        session["_remember"] = "set"
+        if duration is not None:
+            try:
+                # equal to timedelta.total_seconds() but works with Python 2.6
+                session["_remember_seconds"] = (
+                    duration.microseconds
+                    + (duration.seconds + duration.days * 24 * 3600) * 10**6
+                ) / 10.0**6
+            except AttributeError as e:
+                raise Exception(
+                    f"duration must be a datetime.timedelta, instead got: {duration}"
+                ) from e
+
+    current_app.login_manager._update_request_context_with_user(user)
+    user_logged_in.send(current_app._get_current_object(), user=_get_user())
+    return True
+
+
+def logout_user():
+    """
+    Logs a user out. (You do not need to pass the actual user.) This will
+    also clean up the remember me cookie if it exists.
+    """
+
+    user = _get_user()
+
+    if "_user_id" in session:
+        session.pop("_user_id")
+
+    if "_fresh" in session:
+        session.pop("_fresh")
+
+    if "_id" in session:
+        session.pop("_id")
+
+    cookie_name = current_app.config.get("REMEMBER_COOKIE_NAME", COOKIE_NAME)
+    if cookie_name in request.cookies:
+        session["_remember"] = "clear"
+        if "_remember_seconds" in session:
+            session.pop("_remember_seconds")
+
+    user_logged_out.send(current_app._get_current_object(), user=user)
+
+    current_app.login_manager._update_request_context_with_user()
+    return True
+
+
+def confirm_login():
+    """
+    This sets the current session as fresh. Sessions become stale when they
+    are reloaded from a cookie.
+    """
+    session["_fresh"] = True
+    session["_id"] = current_app.login_manager._session_identifier_generator()
+    user_login_confirmed.send(current_app._get_current_object())
+
+
+def login_required(func):
+    """
+    If you decorate a view with this, it will ensure that the current user is
+    logged in and authenticated before calling the actual view. (If they are
+    not, it calls the :attr:`LoginManager.unauthorized` callback.) For
+    example::
+
+        @app.route('/post')
+        @login_required
+        def post():
+            pass
+
+    If there are only certain times you need to require that your user is
+    logged in, you can do so with::
+
+        if not current_user.is_authenticated:
+            return current_app.login_manager.unauthorized()
+
+    ...which is essentially the code that this function adds to your views.
+
+    It can be convenient to globally turn off authentication when unit testing.
+    To enable this, if the application configuration variable `LOGIN_DISABLED`
+    is set to `True`, this decorator will be ignored.
+
+    .. Note ::
+
+        Per `W3 guidelines for CORS preflight requests
+        <http://www.w3.org/TR/cors/#cross-origin-request-with-preflight-0>`_,
+        HTTP ``OPTIONS`` requests are exempt from login checks.
+
+    :param func: The view function to decorate.
+    :type func: function
+    """
+
+    @wraps(func)
+    def decorated_view(*args, **kwargs):
+        if request.method in EXEMPT_METHODS or current_app.config.get("LOGIN_DISABLED"):
+            pass
+        elif not current_user.is_authenticated:
+            return current_app.login_manager.unauthorized()
+
+        # flask 1.x compatibility
+        # current_app.ensure_sync is only available in Flask >= 2.0
+        if callable(getattr(current_app, "ensure_sync", None)):
+            return current_app.ensure_sync(func)(*args, **kwargs)
+        return func(*args, **kwargs)
+
+    return decorated_view
+
+
+def fresh_login_required(func):
+    """
+    If you decorate a view with this, it will ensure that the current user's
+    login is fresh - i.e. their session was not restored from a 'remember me'
+    cookie. Sensitive operations, like changing a password or e-mail, should
+    be protected with this, to impede the efforts of cookie thieves.
+
+    If the user is not authenticated, :meth:`LoginManager.unauthorized` is
+    called as normal. If they are authenticated, but their session is not
+    fresh, it will call :meth:`LoginManager.needs_refresh` instead. (In that
+    case, you will need to provide a :attr:`LoginManager.refresh_view`.)
+
+    Behaves identically to the :func:`login_required` decorator with respect
+    to configuration variables.
+
+    .. Note ::
+
+        Per `W3 guidelines for CORS preflight requests
+        <http://www.w3.org/TR/cors/#cross-origin-request-with-preflight-0>`_,
+        HTTP ``OPTIONS`` requests are exempt from login checks.
+
+    :param func: The view function to decorate.
+    :type func: function
+    """
+
+    @wraps(func)
+    def decorated_view(*args, **kwargs):
+        if request.method in EXEMPT_METHODS or current_app.config.get("LOGIN_DISABLED"):
+            pass
+        elif not current_user.is_authenticated:
+            return current_app.login_manager.unauthorized()
+        elif not login_fresh():
+            return current_app.login_manager.needs_refresh()
         try:
-            matches = glob(arg, recursive=glob_recursive)
-        except re.error:
-            matches = []
+            # current_app.ensure_sync available in Flask >= 2.0
+            return current_app.ensure_sync(func)(*args, **kwargs)
+        except AttributeError:  # pragma: no cover
+            return func(*args, **kwargs)
 
-        if not matches:
-            out.append(arg)
-        else:
-            out.extend(matches)
-
-    return out
+    return decorated_view
 
 
-def __getattr__(name: str) -> object:
-    import warnings
+def set_login_view(login_view, blueprint=None):
+    """
+    Sets the login view for the app or blueprint. If a blueprint is passed,
+    the login view is set for this blueprint on ``blueprint_login_views``.
 
-    if name in {
-        "LazyFile",
-        "KeepOpenFile",
-        "make_default_short_help",
-        "PacifyFlushWrapper",
-        "safecall",
-        "get_text_stream",
-        "get_binary_stream",
-    }:
-        warnings.warn(
-            f"'click.utils.{name}' is deprecated and will be removed in Click 9.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return globals()[f"_{name}"]
+    :param login_view: The user object to log in.
+    :type login_view: str
+    :param blueprint: The blueprint which this login view should be set on.
+        Defaults to ``None``.
+    :type blueprint: object
+    """
 
-    raise AttributeError(name)
+    num_login_views = len(current_app.login_manager.blueprint_login_views)
+    if blueprint is not None or num_login_views != 0:
+        (current_app.login_manager.blueprint_login_views[blueprint.name]) = login_view
+
+        if (
+            current_app.login_manager.login_view is not None
+            and None not in current_app.login_manager.blueprint_login_views
+        ):
+            (
+                current_app.login_manager.blueprint_login_views[None]
+            ) = current_app.login_manager.login_view
+
+        current_app.login_manager.login_view = None
+    else:
+        current_app.login_manager.login_view = login_view
+
+
+def _get_user():
+    if has_request_context():
+        if "_login_user" not in g:
+            current_app.login_manager._load_user()
+
+        return g._login_user
+
+    return None
+
+
+def _cookie_digest(payload, key=None):
+    key = _secret_key(key)
+
+    return hmac.new(key, payload.encode("utf-8"), sha512).hexdigest()
+
+
+def _get_remote_addr():
+    address = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if address is not None:
+        # An 'X-Forwarded-For' header includes a comma separated list of the
+        # addresses, the first address being the actual remote address.
+        address = address.encode("utf-8").split(b",")[0].strip()
+    return address
+
+
+def _create_identifier():
+    user_agent = request.headers.get("User-Agent")
+    if user_agent is not None:
+        user_agent = user_agent.encode("utf-8")
+    base = f"{_get_remote_addr()}|{user_agent}"
+    if str is bytes:
+        base = str(base, "utf-8", errors="replace")  # pragma: no cover
+    h = sha512()
+    h.update(base.encode("utf8"))
+    return h.hexdigest()
+
+
+def _user_context_processor():
+    return dict(current_user=_get_user())
+
+
+def _secret_key(key=None):
+    if key is None:
+        key = current_app.config["SECRET_KEY"]
+
+    if isinstance(key, str):  # pragma: no cover
+        key = key.encode("latin1")  # ensure bytes
+
+    return key
